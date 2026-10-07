@@ -1,0 +1,15 @@
+services:
+  fraud-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the trained artifact at runtime so the image doesn't need to be
+      # rebuilt every time the model is retrained.
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

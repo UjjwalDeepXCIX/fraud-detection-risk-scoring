@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+.venv/
+venv/
+
+# Generated data and model artifacts are reproducible from scripts,
+# not checked in.
+data/raw/*.csv
+models/*.joblib
+models/*.json
+reports/figures/*.png
+
+.env
+.DS_Store
