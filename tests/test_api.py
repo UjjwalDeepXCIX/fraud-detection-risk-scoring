@@ -20,11 +20,12 @@ VALID_PAYLOAD = {
 
 
 @pytest.fixture()
-def client(trained_artifact_path, monkeypatch):
-    # Point the app's startup loader at the session's tiny test artifact
-    # instead of the real default path, so these tests are deterministic
-    # regardless of whether a full model happens to be trained locally.
+def client(trained_artifact_path, graph_artifact_path, monkeypatch):
+    # Point the app's startup loaders at the session's tiny test artifacts
+    # instead of the real default paths, so these tests are deterministic
+    # regardless of whether a full model/graph happens to be built locally.
     monkeypatch.setattr("fraud_detection.api.main.MODEL_ARTIFACT_PATH", trained_artifact_path)
+    monkeypatch.setattr("fraud_detection.api.main.GRAPH_ARTIFACT_PATH", graph_artifact_path)
     with TestClient(app) as test_client:
         yield test_client
     inference_model.pipeline = None
@@ -86,3 +87,60 @@ def test_predict_without_loaded_model_returns_503(monkeypatch, tmp_path):
     with TestClient(app) as test_client:
         response = test_client.post("/predict", json=VALID_PAYLOAD)
     assert response.status_code == 503
+
+
+def test_health_reports_graph_loaded(client):
+    response = client.get("/health")
+    body = response.json()
+    assert body["graph_loaded"] is True
+    assert body["graph_entity_count"] > 0
+
+
+def test_investigate_escalates_on_ring_device(client, ring_device_id):
+    payload = {
+        **VALID_PAYLOAD,
+        "device_id": ring_device_id,
+        "ip_address": "irrelevant-ip-not-in-graph",
+    }
+    response = client.post("/investigate", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["final_risk_level"] == "high"
+    assert any(r["fired"] for r in body["matched_rules"])
+    assert len(body["related_entities"]["customers"]) >= 4
+
+
+def test_investigate_does_not_escalate_on_household_device(client, household_device_id):
+    payload = {
+        **VALID_PAYLOAD,
+        "device_id": household_device_id,
+        "ip_address": "irrelevant-ip-not-in-graph",
+    }
+    response = client.post("/investigate", json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert not any(r["fired"] for r in body["matched_rules"])
+    assert body["final_risk_level"] == body["model_risk_level"]
+
+
+def test_investigate_rejects_missing_device_id(client):
+    response = client.post("/investigate", json=VALID_PAYLOAD)
+    assert response.status_code == 422
+
+
+def test_investigate_without_loaded_graph_returns_503(monkeypatch, trained_artifact_path, tmp_path):
+    monkeypatch.setattr("fraud_detection.api.main.MODEL_ARTIFACT_PATH", trained_artifact_path)
+    monkeypatch.setattr("fraud_detection.api.main.GRAPH_ARTIFACT_PATH", tmp_path / "nonexistent.pkl")
+    with TestClient(app) as test_client:
+        payload = {**VALID_PAYLOAD, "device_id": "DEV1", "ip_address": "IP1"}
+        response = test_client.post("/investigate", json=payload)
+    assert response.status_code == 503
+
+
+def test_predict_still_works_without_device_fields(client):
+    """/predict's contract must stay unchanged for callers who know nothing
+    about the graph layer -- the two network-count fields are optional and
+    default to the neutral "no known fan-out" value.
+    """
+    response = client.post("/predict", json=VALID_PAYLOAD)
+    assert response.status_code == 200
