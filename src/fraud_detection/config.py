@@ -10,6 +10,8 @@ RAW_DATA_PATH = DATA_DIR / "raw" / "transactions.csv"
 MODELS_DIR = ROOT_DIR / "models"
 MODEL_ARTIFACT_PATH = MODELS_DIR / "fraud_model.joblib"
 METRICS_PATH = MODELS_DIR / "metrics.json"
+GRAPH_ARTIFACT_PATH = MODELS_DIR / "entity_graph.pkl"
+ABLATION_METRICS_PATH = MODELS_DIR / "ablation_metrics.json"
 REPORTS_DIR = ROOT_DIR / "reports"
 FIGURES_DIR = REPORTS_DIR / "figures"
 SHAP_SUMMARY_PATH = FIGURES_DIR / "shap_summary.png"
@@ -33,6 +35,16 @@ HIGH_RISK_CATEGORIES = {"electronics", "online_retail", "travel", "jewelry"}
 
 CHANNELS = ["in_store", "online", "atm"]
 
+# Graph-derived features: how many distinct customers have transacted on this
+# device / IP so far (causal, cumulative-to-date). Kept as a named list, not
+# folded directly into NUMERIC_FEATURES by value, so scripts/train_model.py
+# can build a second pipeline with these excluded for an apples-to-apples
+# ablation against the graph-aware model -- see scripts/ablate_network_features.py.
+NETWORK_FEATURES = [
+    "device_distinct_customers_count",
+    "ip_distinct_customers_count",
+]
+
 NUMERIC_FEATURES = [
     "amount",
     "account_age_days",
@@ -44,6 +56,7 @@ NUMERIC_FEATURES = [
     "amount_sum_last_24h",
     "hour_sin",
     "hour_cos",
+    *NETWORK_FEATURES,
 ]
 
 CATEGORICAL_FEATURES = [

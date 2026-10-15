@@ -53,6 +53,20 @@ class TransactionRequest(BaseModel):
     txn_count_last_1h: int = Field(..., ge=0, le=10_000)
     txn_count_last_24h: int = Field(..., ge=0, le=10_000)
     amount_sum_last_24h: float = Field(..., ge=0, le=10_000_000)
+    device_distinct_customers_count: int = Field(
+        default=1,
+        ge=1,
+        le=10_000,
+        description=(
+            "How many distinct customers have transacted on this device so far "
+            "(graph-derived). Optional and defaults to 1 -- the neutral 'no known "
+            "fan-out' assumption -- for callers without feature-store access to "
+            "the real value; /investigate computes it directly from the entity graph."
+        ),
+    )
+    ip_distinct_customers_count: int = Field(
+        default=1, ge=1, le=10_000, description="Same as device_distinct_customers_count, for the IP instead."
+    )
 
     @field_validator("txn_count_last_24h")
     @classmethod
