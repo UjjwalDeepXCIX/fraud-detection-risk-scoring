@@ -97,6 +97,39 @@ class TransactionRequest(BaseModel):
     }
 
 
+class InvestigateRequest(TransactionRequest):
+    """Extends TransactionRequest with the raw entity identifiers needed to
+    query the knowledge graph. Unlike /predict, the caller does NOT need to
+    know device_distinct_customers_count / ip_distinct_customers_count --
+    /investigate looks those up from the graph itself and overrides
+    whatever was supplied here, so the model is always scored against the
+    real, current fan-out rather than a caller-supplied guess.
+    """
+
+    device_id: str = Field(..., min_length=1, description="Raw device identifier; fan-out is looked up from the graph")
+    ip_address: str = Field(..., min_length=1, description="Raw IP identifier; fan-out is looked up from the graph")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "amount": 640.0,
+                "merchant_category": "electronics",
+                "channel": "online",
+                "card_present": False,
+                "is_foreign_transaction": False,
+                "distance_from_home_km": 15.0,
+                "account_age_days": 300,
+                "customer_avg_amount": 70.0,
+                "txn_count_last_1h": 1,
+                "txn_count_last_24h": 2,
+                "amount_sum_last_24h": 900.0,
+                "device_id": "DEV-RING-000012",
+                "ip_address": "IP-RING-000012",
+            }
+        }
+    }
+
+
 class ContributingFactor(BaseModel):
     feature: str
     impact: float
@@ -118,3 +151,31 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     model_trained_at: Optional[str] = None
     threshold: Optional[float] = None
+    graph_loaded: Optional[bool] = None
+    graph_entity_count: Optional[int] = None
+
+
+class RuleResultResponse(BaseModel):
+    rule_name: str
+    fired: bool
+    evidence: dict
+    severity: str
+
+
+class RelatedEntitiesResponse(BaseModel):
+    customers: list[str]
+    devices: list[str]
+    ips: list[str]
+
+
+class InvestigationResponse(BaseModel):
+    transaction_id: Optional[str]
+    fraud_probability: float
+    model_risk_level: str
+    final_risk_level: str
+    escalated: bool
+    threshold_used: float
+    matched_rules: list[RuleResultResponse]
+    related_entities: RelatedEntitiesResponse
+    top_factors: Optional[list[ContributingFactor]] = None
+    latency_ms: float
