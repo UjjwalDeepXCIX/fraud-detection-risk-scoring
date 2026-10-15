@@ -5,6 +5,15 @@ risk signals (velocity, geo-distance, account age, merchant category) so the
 downstream feature engineering and modelling steps have genuine structure to
 learn from rather than pure noise. This avoids depending on a licensed /
 gated external dataset while keeping the pipeline fully reproducible.
+
+Also includes device/IP linkage: most fraud is a single-account burst from an
+unfamiliar device (no cross-account signal at all), a minority is a
+shared-device ring spanning several distinct accounts, and a separate,
+legitimate household scenario has ordinary customers genuinely sharing one
+device -- so "this device is shared" is not by itself a fraud tell, only
+sharing *combined with* the fraud block's other risk signals is. This is the
+raw material the graph-based features and the knowledge-graph investigation
+layer elsewhere in this project are built to use.
 """
 
 from __future__ import annotations
@@ -25,16 +34,52 @@ from fraud_detection.config import (
 
 logger = logging.getLogger(__name__)
 
+# Fraction of customers grouped into households of HOUSEHOLD_SIZE_RANGE members
+# that genuinely share one device/IP for ordinary transactions. This is the
+# legitimate positive-fan-out case: without it, any shared device would be a
+# perfect (and therefore meaningless) fraud tell, since nothing innocent would
+# ever produce one. See _generate_fraud_block for the fraud-side counterpart.
+HOUSEHOLD_FRACTION = 0.06
+HOUSEHOLD_SIZE_RANGE = (2, 4)  # upper bound exclusive, i.e. 2-3 members
+
+# Fraction of fraud transactions generated as "ring" episodes -- several
+# distinct compromised accounts transacting through one shared device/IP in a
+# short window (card-testing / mule-network pattern). The remainder are
+# "solo" episodes: a single account, a fresh device unlinked to anyone else.
+RING_FRAUD_FRACTION = 0.25
+RING_SIZE_RANGE = (4, 7)  # upper bound exclusive, i.e. 4-6 distinct customers
+
 
 def _simulate_customers(n_customers: int, rng: np.random.Generator) -> pd.DataFrame:
     account_age_days = rng.exponential(scale=600, size=n_customers).clip(1, 4000).astype(int)
     avg_amount = rng.lognormal(mean=3.6, sigma=0.7, size=n_customers).clip(5, 2000)
     home_risk = rng.normal(0, 1, size=n_customers)  # latent customer-level risk factor
+
+    device_id = np.array([f"DEV{idx:06d}" for idx in range(n_customers)], dtype=object)
+    ip_address = np.array([f"IP{idx:06d}" for idx in range(n_customers)], dtype=object)
+
+    # Household sharing: group a minority of customers so several genuinely
+    # distinct accounts transact from the same device/IP for entirely
+    # ordinary reasons (a shared family device), not fraud.
+    n_household_members = round(n_customers * HOUSEHOLD_FRACTION)
+    household_pool = rng.choice(n_customers, size=n_household_members, replace=False)
+    cursor = 0
+    while cursor < len(household_pool):
+        size = min(int(rng.integers(*HOUSEHOLD_SIZE_RANGE)), len(household_pool) - cursor)
+        if size < 2:
+            break
+        members = household_pool[cursor : cursor + size]
+        device_id[members[1:]] = device_id[members[0]]
+        ip_address[members[1:]] = ip_address[members[0]]
+        cursor += size
+
     return pd.DataFrame(
         {
             "customer_id": [f"CUST{idx:06d}" for idx in range(n_customers)],
             "account_age_days": account_age_days,
             "customer_avg_amount": avg_amount,
+            "device_id": device_id,
+            "ip_address": ip_address,
             "_home_risk": home_risk,
         }
     )
@@ -78,6 +123,38 @@ def _assign_velocity_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _assign_network_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Causal, cumulative-to-date count of distinct customers seen on the
+    same device / IP, mirroring the backward-only discipline of the velocity
+    features above: only prior-or-current activity is visible, never future
+    rows. A higher count means more distinct accounts have funnelled through
+    this device or IP by this point in time -- the fan-out signature a
+    shared-device fraud ring produces (legitimate household sharing aside,
+    which tops out at 2-3 by construction).
+    """
+
+    def _cumulative_distinct_customer_counts(frame: pd.DataFrame, key: str) -> np.ndarray:
+        # Sort without dropping the original index, so counts computed in
+        # (key, timestamp) order can be mapped back to the caller's row order
+        # at the end via reindex -- reset_index(drop=True) here would discard
+        # exactly the mapping needed to do that correctly.
+        sorted_frame = frame.sort_values([key, "timestamp"])
+        counts = pd.Series(0, index=sorted_frame.index, dtype=int)
+        for _, group in sorted_frame.groupby(key, sort=False):
+            seen: set = set()
+            running = []
+            for cust_id in group["customer_id"]:
+                seen.add(cust_id)
+                running.append(len(seen))
+            counts.loc[group.index] = running
+        return counts.reindex(frame.index).to_numpy()
+
+    df = df.reset_index(drop=True)
+    df["device_distinct_customers_count"] = _cumulative_distinct_customer_counts(df, "device_id")
+    df["ip_distinct_customers_count"] = _cumulative_distinct_customer_counts(df, "ip_address")
+    return df
+
+
 def _generate_legit_block(
     n_legit: int, customers: pd.DataFrame, days: int, start: pd.Timestamp, rng: np.random.Generator
 ) -> pd.DataFrame:
@@ -112,28 +189,16 @@ def _generate_legit_block(
     return block
 
 
-def _generate_fraud_block(
-    n_fraud: int, customers: pd.DataFrame, days: int, start: pd.Timestamp, rng: np.random.Generator
-) -> pd.DataFrame:
-    """Fraudulent transactions are drawn from a distinctly different
-    generative process rather than a noisy shift of the legitimate one:
-    higher amounts relative to the victim's baseline, skewed toward
-    higher-risk merchant categories and online/card-not-present channels,
-    more often foreign, and frequently occurring in short bursts (several
-    transactions against the same compromised account within minutes) --
-    the same patterns real card-testing and account-takeover fraud exhibit.
-    Each signal still overlaps with the legitimate distribution so the
-    problem stays learnable rather than trivially separable.
+def _build_solo_fraud_episodes(
+    n_solo: int, customers: pd.DataFrame, days: int, start: pd.Timestamp, age_weight: np.ndarray, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Single-account fraud bursts (account-takeover style): roughly half are
+    isolated transactions, the rest bursts of 2-4, each episode from a fresh
+    device/IP unlinked to any other account -- an unfamiliar device used
+    against one compromised account, not a shared-device ring.
     """
-    # Slightly favour newer accounts as fraud victims without making account
-    # age a deterministic tell.
-    age_weight = np.exp(-customers["account_age_days"].to_numpy() / 1500.0)
-    age_weight = age_weight / age_weight.sum()
-
-    # Build fraud "episodes": roughly half of fraud transactions are isolated,
-    # the rest occur in bursts of 2-4 against the same account.
     episode_sizes: list[int] = []
-    remaining = n_fraud
+    remaining = n_solo
     while remaining > 0:
         if remaining == 1 or rng.random() < 0.5:
             size = 1
@@ -145,30 +210,120 @@ def _generate_fraud_block(
 
     n_episodes = len(episode_sizes)
     episode_customer_idx = rng.choice(len(customers), size=n_episodes, p=age_weight)
+    customer_idx = np.repeat(episode_customer_idx, episode_sizes)
 
-    fraud_customer_idx = np.repeat(episode_customer_idx, episode_sizes)
-    block = customers.iloc[fraud_customer_idx].reset_index(drop=True)
-
-    # Timestamps: one base time per episode, with burst transactions landing
-    # within a tight window after it. ~40% of episodes are biased toward
-    # late-night hours (a common fraud pattern), the rest spread normally.
-    timestamps = np.empty(n_fraud, dtype="datetime64[ns]")
+    timestamps = np.empty(n_solo, dtype="datetime64[ns]")
+    device_id = np.empty(n_solo, dtype=object)
+    ip_address = np.empty(n_solo, dtype=object)
     cursor = 0
-    for size in episode_sizes:
+    for episode_num, size in enumerate(episode_sizes):
         day_offset = rng.integers(0, days)
-        if rng.random() < 0.4:
-            hour = rng.uniform(1, 5)
-        else:
-            hour = rng.uniform(0, 24)
+        # ~40% of episodes are biased toward late-night hours (a common
+        # fraud pattern), the rest spread normally.
+        hour = rng.uniform(1, 5) if rng.random() < 0.4 else rng.uniform(0, 24)
         base_time = start + pd.Timedelta(days=int(day_offset)) + pd.Timedelta(hours=hour)
-        if size == 1:
-            offsets = np.array([0.0])
-        else:
-            offsets = np.sort(rng.uniform(0, 45 * 60, size=size))  # within a 45-minute window
+        offsets = np.array([0.0]) if size == 1 else np.sort(rng.uniform(0, 45 * 60, size=size))
         episode_times = base_time + pd.to_timedelta(offsets, unit="s")
         timestamps[cursor : cursor + size] = episode_times.to_numpy()
+        device_id[cursor : cursor + size] = f"DEV-SOLO-{episode_num:06d}"
+        ip_address[cursor : cursor + size] = f"IP-SOLO-{episode_num:06d}"
         cursor += size
-    block["timestamp"] = timestamps
+
+    return customer_idx, timestamps, device_id, ip_address
+
+
+def _build_ring_fraud_episodes(
+    n_ring: int, customers: pd.DataFrame, days: int, start: pd.Timestamp, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Shared-device fraud rings: RING_SIZE_RANGE distinct customer accounts,
+    one transaction each, all transacting through the same device/IP within
+    a short window -- the card-testing / mule-network pattern that a
+    row-by-row model cannot see, since the tell is in the relationship
+    between transactions, not in any single transaction's own features.
+    """
+    if n_ring == 0:
+        empty_obj = np.array([], dtype=object)
+        return np.array([], dtype=int), np.array([], dtype="datetime64[ns]"), empty_obj, empty_obj
+
+    ring_sizes: list[int] = []
+    remaining = n_ring
+    while remaining > 0:
+        if remaining < RING_SIZE_RANGE[0]:
+            # Too few transactions left for a standalone ring -- fold the
+            # leftover into the previous ring rather than emit an
+            # undersized one that would blur into the household signal.
+            if ring_sizes:
+                ring_sizes[-1] += remaining
+            else:
+                ring_sizes.append(remaining)
+            remaining = 0
+        else:
+            size = min(int(rng.integers(*RING_SIZE_RANGE)), remaining)
+            ring_sizes.append(size)
+            remaining -= size
+
+    customer_idx_parts = []
+    timestamps = np.empty(n_ring, dtype="datetime64[ns]")
+    device_id = np.empty(n_ring, dtype=object)
+    ip_address = np.empty(n_ring, dtype=object)
+    cursor = 0
+    for ring_num, size in enumerate(ring_sizes):
+        # Ring membership is unweighted -- a compromised device can land on
+        # any account, not preferentially newer ones (unlike solo takeover).
+        members = rng.choice(len(customers), size=size, replace=False)
+        customer_idx_parts.append(members)
+
+        day_offset = rng.integers(0, days)
+        hour = rng.uniform(0, 24)
+        base_time = start + pd.Timedelta(days=int(day_offset)) + pd.Timedelta(hours=hour)
+        offsets = np.sort(rng.uniform(0, 60 * 60, size=size))  # within a 60-minute window
+        episode_times = base_time + pd.to_timedelta(offsets, unit="s")
+        timestamps[cursor : cursor + size] = episode_times.to_numpy()
+        device_id[cursor : cursor + size] = f"DEV-RING-{ring_num:06d}"
+        ip_address[cursor : cursor + size] = f"IP-RING-{ring_num:06d}"
+        cursor += size
+
+    customer_idx = np.concatenate(customer_idx_parts)
+    return customer_idx, timestamps, device_id, ip_address
+
+
+def _generate_fraud_block(
+    n_fraud: int, customers: pd.DataFrame, days: int, start: pd.Timestamp, rng: np.random.Generator
+) -> pd.DataFrame:
+    """Fraudulent transactions are drawn from a distinctly different
+    generative process rather than a noisy shift of the legitimate one:
+    higher amounts relative to the victim's baseline, skewed toward
+    higher-risk merchant categories and online/card-not-present channels,
+    more often foreign, and frequently occurring in short bursts. Most
+    fraud is a single-account burst from an unfamiliar device
+    (``_build_solo_fraud_episodes``); a minority is a shared-device ring
+    spanning several distinct accounts (``_build_ring_fraud_episodes``) --
+    the pattern the graph-based features elsewhere in this project are
+    specifically built to catch. Each signal still overlaps with the
+    legitimate distribution so the problem stays learnable rather than
+    trivially separable.
+    """
+    # Slightly favour newer accounts as solo-fraud victims without making
+    # account age a deterministic tell. Ring membership is unweighted (see
+    # _build_ring_fraud_episodes).
+    age_weight = np.exp(-customers["account_age_days"].to_numpy() / 1500.0)
+    age_weight = age_weight / age_weight.sum()
+
+    n_ring = round(n_fraud * RING_FRAUD_FRACTION)
+    n_solo = n_fraud - n_ring
+
+    solo_customer_idx, solo_timestamps, solo_device_id, solo_ip = _build_solo_fraud_episodes(
+        n_solo, customers, days, start, age_weight, rng
+    )
+    ring_customer_idx, ring_timestamps, ring_device_id, ring_ip = _build_ring_fraud_episodes(
+        n_ring, customers, days, start, rng
+    )
+
+    fraud_customer_idx = np.concatenate([solo_customer_idx, ring_customer_idx])
+    block = customers.iloc[fraud_customer_idx].reset_index(drop=True)
+    block["timestamp"] = np.concatenate([solo_timestamps, ring_timestamps])
+    block["device_id"] = np.concatenate([solo_device_id, ring_device_id])
+    block["ip_address"] = np.concatenate([solo_ip, ring_ip])
 
     # Amount: heavy-tailed multiplier on the victim's personal baseline --
     # fraud tends to cash out well above the account's usual spend, but with
@@ -229,6 +384,7 @@ def generate_transactions(
     txns["transaction_id"] = [f"TXN{idx:08d}" for idx in range(len(txns))]
 
     txns = _assign_velocity_features(txns)
+    txns = _assign_network_features(txns)
     txns = txns.drop(columns=["_home_risk"])
 
     ordered_cols = [
@@ -243,9 +399,13 @@ def generate_transactions(
         "distance_from_home_km",
         "account_age_days",
         "customer_avg_amount",
+        "device_id",
+        "ip_address",
         "txn_count_last_1h",
         "txn_count_last_24h",
         "amount_sum_last_24h",
+        "device_distinct_customers_count",
+        "ip_distinct_customers_count",
         "is_fraud",
     ]
     return txns[ordered_cols].sort_values("timestamp").reset_index(drop=True)
